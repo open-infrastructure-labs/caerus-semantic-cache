@@ -263,8 +263,15 @@ class SemanticCache(
         } else {
           CaerusFalse()
         }
-      case CaerusCaching(name, child) =>
-        val bytesWritten: Long = startCacheIntermediateData(child, Tier.STORAGE_DISK, name.split(Path.SEPARATOR).last)
+      case CaerusCaching(name, caerusPlan, child) =>
+        val initialPlan: LogicalPlan = transformBack(caerusPlan, inputPlan, inputCaerusPlan)
+        val optimizedPlan: LogicalPlan = transformBack(child, inputPlan, inputCaerusPlan)
+        val bytesWritten: Long = startCacheIntermediateData(
+          initialPlan,
+          optimizedPlan,
+          Tier.STORAGE_DISK,
+          name.split(Path.SEPARATOR).last
+        )
         if (bytesWritten >= 0) {
           CaerusTrue()
         } else {
@@ -607,12 +614,17 @@ class SemanticCache(
     startFileSkippingIndexing(loadDF, indexedAttribute, tier, name)
   }
 
-  private def startCacheIntermediateData(logicalPlan: LogicalPlan, tier: Tier, name: String): Long = {
+  private def startCacheIntermediateData(
+    initialPlan: LogicalPlan,
+    optimizedPlan: LogicalPlan,
+    tier: Tier,
+    name: String
+  ): Long = {
     val beginTime: Long = System.nanoTime()
 
     // Transform logical plan to CaerusPlan.
-    val caerusPlan = transform(logicalPlan)
-    val candidate: Caching = Caching(caerusPlan)
+    val caerusInitialPlan = transform(initialPlan)
+    val candidate: Caching = Caching(caerusInitialPlan)
     sizeEstimator.estimateSize(candidate)
     logger.debug("JSON Candidate:\n%s".format(candidate.toJSON))
     val path: String = try {
@@ -637,11 +649,11 @@ class SemanticCache(
         bucketSpec = None,
         fileFormat = new ParquetFileFormat(),
         options = Map.empty[String,String],
-        query = logicalPlan,
+        query = optimizedPlan,
         mode = SaveMode.Overwrite,
         catalogTable = None,
         fileIndex = None,
-        outputColumnNames = logicalPlan.output.map(_.name))
+        outputColumnNames = optimizedPlan.output.map(_.name))
       val queryExecution: QueryExecution = spark.sessionState.executePlan(writePlan)
       queryExecution.toRdd
       false
@@ -708,7 +720,7 @@ class SemanticCache(
       logger.warn("The following plan is not supported for caching:\n%s".format(logicalPlan))
       return 0L
     }
-    startCacheIntermediateData(logicalPlan, tier, name)
+    startCacheIntermediateData(logicalPlan, logicalPlan, tier, name)
   }
 
   /**
@@ -818,9 +830,6 @@ class SemanticCache(
  * Easy way to activate semantic cache optimization for users.
  */
 object SemanticCache {
-  var semanticCache: Option[SemanticCache] = None
-  var logger: Option[Logger] = None
-
   private[client] def getIndex(attrib: Attribute) = attrib.exprId.id.toInt
 
   private[cache] def checkSupport(plan: LogicalPlan): Support[Boolean] = {
@@ -884,11 +893,8 @@ object SemanticCache {
   private def transformCanonicalized(plan: LogicalPlan): CaerusPlan = {
     val caerusPlan = plan match {
       case LogicalRelation(hadoopFsRelation: HadoopFsRelation, output, _, _) =>
-        if (!hadoopFsRelation.fileFormat.isInstanceOf[DataSourceRegister]) {
-          if (logger.isDefined)
-            logger.get.warn("File format %s is not supported.\n".format(hadoopFsRelation.fileFormat))
+        if (!hadoopFsRelation.fileFormat.isInstanceOf[DataSourceRegister])
           return plan
-        }
         val inputFiles: Seq[FileStatus] = hadoopFsRelation.location.asInstanceOf[PartitioningAwareFileIndex].allFiles()
         val inputs: Seq[SourceInfo] =
           inputFiles.map(f => SourceInfo(f.getPath.toString, f.getModificationTime, 0, f.getLen))
@@ -902,13 +908,10 @@ object SemanticCache {
 
   private[cache] def transform(plan: LogicalPlan): CaerusPlan = {
     val canonicalizedPlan: CaerusPlan = plan.canonicalized
-    if (logger.isDefined)
-      logger.get.debug("Canonicalized Spark Plan:\n%s".format(canonicalizedPlan))
     transformCanonicalized(canonicalizedPlan)
   }
 
   def activate(sparkSession: SparkSession, semanticCacheURI: String): Unit = {
-    semanticCache = Some(new SemanticCache(sparkSession, semanticCacheURI))
-    logger = Some(semanticCache.get.logger)
+    new SemanticCache(sparkSession, semanticCacheURI)
   }
 }
